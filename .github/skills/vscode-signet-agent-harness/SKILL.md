@@ -11,7 +11,7 @@ Build a deterministic Signet integration layer for VS Code custom agents.
 This skill packages the workflow already exercised in this repository:
 
 - A shared Signet harness name for all VS Code custom agents.
-- Thin PowerShell hook adapters for `SessionStart`, `UserPromptSubmit`, `PreCompact`, and `Stop`.
+- Thin PowerShell hook adapters for `SessionStart`, `UserPromptSubmit`, and `Stop`.
 - A generated live-context file fallback for prompt-time refresh when VS Code hook
   output is not injected directly into model context.
 - A final adjacent-artifact audit so the harness is not shipped with only part of
@@ -45,10 +45,9 @@ This skill packages the workflow already exercised in this repository:
 
 2. Define the artifact set up front.
    - Agent definition file.
-  - `SessionStart`, `UserPromptSubmit`, `PreCompact`, and `Stop` hook scripts.
+   - `SessionStart`, `UserPromptSubmit`, and `Stop` hook scripts.
    - Generated live-context file path, if prompt-submit injection needs a
      fallback.
-  - Workspace instructions file describing how generated context is consumed.
    - A design note or spec if the harness is new or materially changing.
 
 3. Keep the adapter layer thin.
@@ -81,7 +80,6 @@ This skill packages the workflow already exercised in this repository:
 
 7. Validate behavior.
    - Verify `SessionStart` injects context or a clear diagnostic.
-  - Verify `PreCompact` preserves compaction behavior even when Signet is unavailable.
    - Verify `UserPromptSubmit` refreshes Signet state on each prompt.
    - Verify Signet dashboard attribution uses the intended harness name.
    - Verify Signet failures do not break the chat turn.

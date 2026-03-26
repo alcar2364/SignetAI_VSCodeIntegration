@@ -7,8 +7,8 @@ function Get-SignetSessionIdentity {
     $sessionIdentityParts = @(
         $AgentIdentity,
         $HookInput.sessionKey,
-        $HookInput.session_key,
         $HookInput.sessionId,
+        $HookInput.session_key,
         $HookInput.session_id
     ) | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) }
 
@@ -97,7 +97,7 @@ function Get-SignetSessionKey {
         [object]$HookInput
     )
 
-    foreach ($candidate in @($HookInput.sessionKey, $HookInput.session_key, $HookInput.sessionId, $HookInput.session_id)) {
+    foreach ($candidate in @($HookInput.sessionKey, $HookInput.sessionId, $HookInput.session_key, $HookInput.session_id)) {
         if ($candidate -is [string] -and -not [string]::IsNullOrWhiteSpace($candidate)) {
             return $candidate
         }
@@ -122,7 +122,19 @@ function Get-SignetTranscriptWindow {
         }
     }
 
-    $content = [System.IO.File]::ReadAllText($TranscriptPath)
+    try {
+        $content = [System.IO.File]::ReadAllText($TranscriptPath)
+    }
+    catch {
+        return @{
+            transcriptPath = $TranscriptPath
+            content = ""
+            currentLength = 0
+            startOffset = 0
+            exists = $false
+        }
+    }
+
     $currentLength = $content.Length
     $startOffset = 0
 

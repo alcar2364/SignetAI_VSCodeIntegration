@@ -1,3 +1,8 @@
 {
-    
+  "timestamp": "2026-03-26T16:20:01.278Z",
+  "hook_event_name": "UserPromptSubmit",
+  "session_id": "2bf1759f-aa34-45af-a273-857edf7af293",
+  "transcript_path": "c:\\Users\\Robert\\AppData\\Roaming\\Code - Insiders\\User\\workspaceStorage\\6e04cf11c87c37b1fd984ade87137a0e\\GitHub.copilot-chat\\transcripts\\2bf1759f-aa34-45af-a273-857edf7af293.jsonl",
+  "prompt": "Check each script and make sure they are working and generate the right files",
+  "cwd": "c:\\Coding\\SignetAI\\VSCodeIntegration\\SignetAI_VSCode_Integration"
 }

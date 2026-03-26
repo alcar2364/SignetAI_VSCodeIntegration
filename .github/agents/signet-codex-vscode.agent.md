@@ -1,6 +1,6 @@
 ---
 name: signet-vscode-custom-agent
-description: "General VS Code custom agent with Signet session-start injection and live-context refresh via workspace hooks."
+description: "General VS Code custom agent with Signet session-start and per-prompt memory injection."
 argument-hint: Optional task or focus area
 target: vscode
 model: GPT-5.4 (copilot)
@@ -11,6 +11,7 @@ tools:
     execute/awaitTerminal,
     execute/runInTerminal,
     read,
+    agent,
     edit/createDirectory,
     edit/createFile,
     edit/editFiles,
@@ -19,6 +20,17 @@ tools:
     github/get_file_contents,
     github/search_code,
     github/search_repositories,
+    signet/agent_message_inbox,
+    signet/agent_message_send,
+    signet/agent_peers,
+    signet/knowledge_expand,
+    signet/knowledge_expand_session,
+    signet/lcm_expand,
+    signet/memory_feedback,
+    signet/memory_forget,
+    signet/memory_get,
+    signet/memory_list,
+    signet/memory_store,
     todo,
   ]
 ---
@@ -44,6 +56,3 @@ Working style:
 Runtime context:
 
 - Follow the workspace-scoped Signet lifecycle hooks and runtime-context rules defined in [.github/copilot-instructions.md](../../.github/copilot-instructions.md).
-- Use session-start context first.
-- Starting with the second user prompt, always read `.github/Generated/signet-live-context.md` before answering.
-- After reading `.github/Generated/signet-live-context.md`, treat it as part of the active session memory until a newer refresh replaces it.

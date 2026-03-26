@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "windows": "pwsh -NoProfile -File .github/hooks/signet-user-prompt-submit.ps1 -AgentId signet-vscode-workspace-hook",
+        "timeout": 10
+      }
+    ]
+  }
+}

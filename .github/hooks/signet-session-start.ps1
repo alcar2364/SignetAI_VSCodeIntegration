@@ -37,43 +37,6 @@ function Get-HookInputObject {
     }
 }
 
-function Get-FirstNonEmptyValue {
-    param(
-        [object[]]$Values,
-        [string]$Default = ""
-    )
-
-    foreach ($value in $Values) {
-        if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) {
-            return $value
-        }
-    }
-
-    return $Default
-}
-
-function Get-NormalizedSessionMetadata {
-    param(
-        [object]$HookInput
-    )
-
-    $sessionKey = Get-FirstNonEmptyValue -Values @(
-        $HookInput.sessionKey,
-        $HookInput.session_key
-    )
-
-    $sessionId = Get-FirstNonEmptyValue -Values @(
-        $HookInput.sessionId,
-        $HookInput.session_id,
-        $sessionKey
-    )
-
-    return @{
-        sessionKey = $sessionKey
-        sessionId = $sessionId
-    }
-}
-
 function Write-GeneratedContextFile {
     param(
         [string]$Path,
@@ -93,16 +56,95 @@ function Write-GeneratedContextFile {
     [System.IO.File]::WriteAllText($Path, $content, [System.Text.UTF8Encoding]::new($false))
 }
 
+function New-SignetAutoInjectPayload {
+    param(
+        [string]$Source,
+        [string]$SessionKey,
+        [string]$Inject
+    )
+
+    $payloadHeader = "[signet:auto-inject source={0} session_key={1} generated_at_utc={2}]" -f
+        $Source,
+        (Get-FirstNonEmptyValue -Values @($SessionKey) -Default "unknown"),
+        [DateTime]::UtcNow.ToString("o")
+
+    return @(
+        $payloadHeader
+        ""
+        $Inject.Trim()
+    ) -join [Environment]::NewLine
+}
+
+function New-SignetDebugSummary {
+    param(
+        [string]$Source,
+        [string]$SessionKey,
+        [string]$Inject,
+        [string]$RoleDescription
+    )
+
+    $safeInject = if ($Inject) { $Inject } else { "" }
+    $previewLine = (($safeInject -replace "\r?\n", " ").Trim())
+    if ($previewLine.Length -gt 160) {
+        $previewLine = $previewLine.Substring(0, 160) + "..."
+    }
+
+    return @(
+        "# Signet Debug Snapshot"
+        ""
+        "- Debug only: true"
+        ("- Role: {0}" -f $RoleDescription)
+        ("- Source: {0}" -f $Source)
+        ("- Session key: {0}" -f (Get-FirstNonEmptyValue -Values @($SessionKey) -Default "unknown"))
+        ("- Generated at UTC: {0}" -f [DateTime]::UtcNow.ToString("o"))
+        ("- Inject chars: {0}" -f $safeInject.Length)
+        ("- Contains memory-feedback block: {0}" -f ($safeInject.Contains("<memory-feedback>")))
+        ("- Preview: {0}" -f (Get-FirstNonEmptyValue -Values @($previewLine) -Default "<empty>"))
+        ""
+        "## Full Inject Payload"
+        ""
+        (Get-FirstNonEmptyValue -Values @($safeInject.Trim()) -Default "<empty>")
+    ) -join [Environment]::NewLine
+}
+
+function Get-FirstNonEmptyValue {
+    param(
+        [object[]]$Values,
+        [string]$Default = ""
+    )
+
+    foreach ($value in $Values) {
+        if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
+    }
+
+    return $Default
+}
+
+function Get-HookSessionKey {
+    param(
+        [object]$HookInput
+    )
+
+    return Get-FirstNonEmptyValue -Values @(
+        $HookInput.sessionKey,
+        $HookInput.sessionId,
+        $HookInput.session_key,
+        $HookInput.session_id
+    )
+}
+
 function Get-SessionStatePath {
     param(
         [object]$HookInput,
         [string]$AgentIdentity
     )
 
+    $sessionKey = Get-HookSessionKey -HookInput $HookInput
     $sessionIdentityParts = @(
         $AgentIdentity,
-        $HookInput.sessionKey,
-        $HookInput.sessionId
+        $sessionKey
     ) | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) }
 
     $sessionIdentity = $sessionIdentityParts -join "|"
@@ -124,10 +166,11 @@ function Initialize-PromptRefreshState {
 
     New-Item -ItemType Directory -Path $promptRefreshStateDir -Force | Out-Null
 
+    $sessionKey = Get-HookSessionKey -HookInput $HookInput
     $state = @{
         agentId = $AgentIdentity
-        sessionKey = $HookInput.sessionKey
-        sessionId = $HookInput.sessionId
+        sessionKey = $sessionKey
+        sessionId = $sessionKey
         skipNextPromptRefresh = $true
         initializedAtUtc = [DateTime]::UtcNow.ToString("o")
     }
@@ -136,22 +179,19 @@ function Initialize-PromptRefreshState {
 }
 
 $hookInput = Get-HookInputObject
-$sessionMetadata = Get-NormalizedSessionMetadata -HookInput $hookInput
 $sessionStatePath = Get-SessionStatePath -HookInput $hookInput -AgentIdentity $AgentId
 
 try {
+    $sessionKey = Get-HookSessionKey -HookInput $hookInput
     $body = @{
         harness = $harnessName
         agentId = $AgentId
-        projectPath = $projectPath
+        project = $projectPath
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($sessionMetadata.sessionKey)) {
-        $body.sessionKey = $sessionMetadata.sessionKey
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($sessionMetadata.sessionId)) {
-        $body.sessionId = $sessionMetadata.sessionId
+    if (-not [string]::IsNullOrWhiteSpace($sessionKey)) {
+        $body.sessionKey = $sessionKey
+        $body.sessionId = $sessionKey
     }
 
     if ($null -ne $hookInput.context) {
@@ -169,14 +209,15 @@ catch {
     $inject = "[signet] SessionStart hook failed for harness '$harnessName': $($_.Exception.Message)"
 }
 
-Write-GeneratedContextFile -Path $sessionStartContextPath -Inject $inject -Source "SessionStart"
-Write-GeneratedContextFile -Path $liveContextPath -Inject "[signet] SessionStart completed. Live context activates on the second user prompt." -Source "SessionStart"
-Initialize-PromptRefreshState -Path $sessionStatePath -HookInput (@{ sessionKey = $sessionMetadata.sessionKey; sessionId = $sessionMetadata.sessionId }) -AgentIdentity $AgentId
+$sessionKey = Get-HookSessionKey -HookInput $hookInput
+Write-GeneratedContextFile -Path $sessionStartContextPath -Inject (New-SignetDebugSummary -Source "SessionStart" -SessionKey $sessionKey -Inject $inject -RoleDescription "Diagnostic mirror of SessionStart injection. Agents must not read this file.") -Source "SessionStart"
+Write-GeneratedContextFile -Path $liveContextPath -Inject (New-SignetDebugSummary -Source "SessionStart" -SessionKey $sessionKey -Inject "[signet] SessionStart completed. Live context is delivered through hook auto-injection." -RoleDescription "Diagnostic mirror of the live-context channel. Agents must not read this file.") -Source "SessionStart"
+Initialize-PromptRefreshState -Path $sessionStatePath -HookInput $hookInput -AgentIdentity $AgentId
 
 @{
     hookSpecificOutput = @{
         hookEventName = "SessionStart"
-        additionalContext = $inject.Trim()
+        additionalContext = (New-SignetAutoInjectPayload -Source "SessionStart" -SessionKey $sessionKey -Inject $inject)
     }
 } | ConvertTo-Json -Depth 5
 

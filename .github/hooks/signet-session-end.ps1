@@ -38,12 +38,10 @@ function Get-HookInputObject {
 try {
     $hookInput = Get-HookInputObject
     $sessionStatePath = Get-SignetTranscriptStatePath -GeneratedDir $generatedDir -HookInput $hookInput -AgentIdentity $AgentId
-    $transcriptState = Read-SignetTranscriptState -Path $sessionStatePath
     $transcriptPath = Get-SignetHookTranscriptPath -HookInput $hookInput
     $sessionKey = Get-SignetSessionKey -HookInput $hookInput
+    $effectiveTranscriptPath = $transcriptPath
 
-    # Stop is the terminal boundary: full transcript extraction for LLM-based memory extraction
-    # This is the ONLY place where memory extraction happens, not at PreCompact
     $body = @{
         harness = $harnessName
         agentId = $AgentId
@@ -58,27 +56,42 @@ try {
         $body.cwd = $hookInput.cwd
     }
 
-    # Forward the transcript path as-is (VS Code provides this in the hook input)
-    if (-not [string]::IsNullOrWhiteSpace($transcriptPath)) {
-        $body.transcript_path = $transcriptPath
+    if ($null -ne $hookInput.reason) {
+        $body.reason = $hookInput.reason
     }
 
-    # Fallback: if VS Code hook provided transcript directly, use it
-    if (-not [string]::IsNullOrWhiteSpace($transcriptPath)) {
+    if (-not [string]::IsNullOrWhiteSpace($transcriptPath) -and (Test-Path $transcriptPath)) {
         try {
-            $fullTranscript = [System.IO.File]::ReadAllText($transcriptPath)
-            if (-not [string]::IsNullOrWhiteSpace($fullTranscript)) {
-                $body.transcript = Convert-SignetTranscriptContent -RawTranscript $fullTranscript
+            $rawTranscript = [System.IO.File]::ReadAllText($transcriptPath)
+            $normalizedTranscript = Convert-SignetTranscriptContent -RawTranscript $rawTranscript
+
+            # VS Code custom-agent transcripts are JSONL; Signet's generic parser does not currently
+            # recognize their user.message / assistant.message shape, so hand off a normalized file.
+            if (-not [string]::IsNullOrWhiteSpace($normalizedTranscript) -and ($normalizedTranscript -ne $rawTranscript)) {
+                $normalizedTranscriptDir = Join-Path $generatedDir "normalized-transcripts"
+                New-Item -ItemType Directory -Path $normalizedTranscriptDir -Force | Out-Null
+
+                $normalizedTranscriptName = "{0}.session-end.txt" -f [System.IO.Path]::GetFileNameWithoutExtension($transcriptPath)
+                $effectiveTranscriptPath = Join-Path $normalizedTranscriptDir $normalizedTranscriptName
+
+                [System.IO.File]::WriteAllText(
+                    $effectiveTranscriptPath,
+                    $normalizedTranscript + [Environment]::NewLine,
+                    [System.Text.UTF8Encoding]::new($false)
+                )
             }
         }
         catch {
-            # Transcript file unavailable — send path for Signet to read
+            $effectiveTranscriptPath = $transcriptPath
         }
     }
 
-    # Fallback: if hook provided transcript directly in payload, use it
-    if ((-not $body.ContainsKey("transcript")) -and $null -ne $hookInput.transcript) {
-        $body.transcript = Convert-SignetTranscriptContent -RawTranscript $hookInput.transcript
+    if (-not [string]::IsNullOrWhiteSpace($effectiveTranscriptPath)) {
+        $body.transcriptPath = $effectiveTranscriptPath
+    }
+
+    if ((-not $body.ContainsKey("transcriptPath")) -and $null -ne $hookInput.transcript -and $hookInput.transcript -is [string] -and -not [string]::IsNullOrWhiteSpace($hookInput.transcript)) {
+        $body.transcript = $hookInput.transcript
     }
 
     $response = Invoke-RestMethod -Method Post -Uri "$daemonUrl/api/hooks/session-end" -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 10) -TimeoutSec 10

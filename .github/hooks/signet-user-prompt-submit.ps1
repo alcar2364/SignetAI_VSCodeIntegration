@@ -2,6 +2,8 @@ param(
     [string]$AgentId = "signet-vscode-custom-agent"
 )
 
+. (Join-Path $PSScriptRoot "signet-transcript-state.ps1")
+
 $ErrorActionPreference = "Stop"
 
 $harnessName = "vscode-custom-agent"
@@ -10,7 +12,10 @@ $daemonUrl = "http://127.0.0.1:3850"
 $generatedDir = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\generated"))
 $liveContextPath = Join-Path $generatedDir "signet-live-context.md"
 $debugInputPath = Join-Path $generatedDir "signet-last-user-prompt-input.json"
+$promptSubmitAuditPath = Join-Path $generatedDir "signet-user-prompt-submit-audit.jsonl"
 $promptRefreshStateDir = Join-Path $generatedDir "prompt-refresh-state"
+$experimentConfigPath = Join-Path $generatedDir "live-context-injection-experiment.json"
+$experimentLogPath = Join-Path $generatedDir "live-context-injection-results.jsonl"
 $script:HookInputRaw = ($input | Out-String)
 
 function Get-HookInputObject {
@@ -37,28 +42,6 @@ function Get-HookInputObject {
     }
 }
 
-function Get-NormalizedSessionMetadata {
-    param(
-        [object]$HookInput
-    )
-
-    $sessionKey = Get-FirstNonEmptyValue -Values @(
-        $HookInput.sessionKey,
-        $HookInput.session_key
-    )
-
-    $sessionId = Get-FirstNonEmptyValue -Values @(
-        $HookInput.sessionId,
-        $HookInput.session_id,
-        $sessionKey
-    )
-
-    return @{
-        sessionKey = $sessionKey
-        sessionId = $sessionId
-    }
-}
-
 function Write-LiveContextFile {
     param(
         [string]$Inject,
@@ -77,6 +60,65 @@ function Write-LiveContextFile {
     [System.IO.File]::WriteAllText($liveContextPath, $content, [System.Text.UTF8Encoding]::new($false))
 }
 
+function New-SignetAutoInjectPayload {
+    param(
+        [string]$Source,
+        [string]$SessionKey,
+        [string]$Inject
+    )
+
+    $payloadHeader = "[signet:auto-inject source={0} session_key={1} generated_at_utc={2}]" -f
+        $Source,
+        (Get-FirstNonEmptyValue -Values @($SessionKey) -Default "unknown"),
+        [DateTime]::UtcNow.ToString("o")
+
+    $memoryFeedback = Get-MemoryFeedbackMetadata -Inject $Inject -DefaultSessionKey $SessionKey
+    $feedbackDirective = New-MemoryFeedbackDirective -Metadata $memoryFeedback
+
+    $parts = @($payloadHeader)
+    if (-not [string]::IsNullOrWhiteSpace($feedbackDirective)) {
+        $parts += ""
+        $parts += $feedbackDirective.Trim()
+    }
+
+    $parts += ""
+    $parts += $Inject.Trim()
+
+    return $parts -join [Environment]::NewLine
+}
+
+function New-SignetDebugSummary {
+    param(
+        [string]$Source,
+        [string]$SessionKey,
+        [string]$Inject,
+        [string]$RoleDescription
+    )
+
+    $safeInject = if ($Inject) { $Inject } else { "" }
+    $previewLine = (($safeInject -replace "\r?\n", " ").Trim())
+    if ($previewLine.Length -gt 160) {
+        $previewLine = $previewLine.Substring(0, 160) + "..."
+    }
+
+    return @(
+        "# Signet Debug Snapshot"
+        ""
+        "- Debug only: true"
+        ("- Role: {0}" -f $RoleDescription)
+        ("- Source: {0}" -f $Source)
+        ("- Session key: {0}" -f (Get-FirstNonEmptyValue -Values @($SessionKey) -Default "unknown"))
+        ("- Generated at UTC: {0}" -f [DateTime]::UtcNow.ToString("o"))
+        ("- Inject chars: {0}" -f $safeInject.Length)
+        ("- Contains memory-feedback block: {0}" -f ($safeInject.Contains("<memory-feedback>")))
+        ("- Preview: {0}" -f (Get-FirstNonEmptyValue -Values @($previewLine) -Default "<empty>"))
+        ""
+        "## Full Inject Payload"
+        ""
+        (Get-FirstNonEmptyValue -Values @($safeInject.Trim()) -Default "<empty>")
+    ) -join [Environment]::NewLine
+}
+
 function Write-DebugInputFile {
     param(
         [object]$HookInput
@@ -85,6 +127,258 @@ function Write-DebugInputFile {
     New-Item -ItemType Directory -Path $generatedDir -Force | Out-Null
     $json = $HookInput | ConvertTo-Json -Depth 20
     [System.IO.File]::WriteAllText($debugInputPath, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Get-Sha256Hex {
+    param(
+        [string]$Text
+    )
+
+    $safeText = if ($null -ne $Text) { $Text } else { "" }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($safeText)
+    return [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Get-MemoryFeedbackMetadata {
+    param(
+        [string]$Inject,
+        [string]$DefaultSessionKey
+    )
+
+    $safeInject = if ($null -ne $Inject) { $Inject } else { "" }
+    $sessionKey = $DefaultSessionKey
+    $memoryIds = @()
+    $hasBlock = $safeInject.Contains("<memory-feedback>")
+
+    if ($hasBlock) {
+        $sessionKeyMatch = [System.Text.RegularExpressions.Regex]::Match(
+            $safeInject,
+            'Pass session_key "(?<sessionKey>[^"]+)"',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        if ($sessionKeyMatch.Success) {
+            $sessionKey = $sessionKeyMatch.Groups['sessionKey'].Value
+        }
+
+        $idsMatch = [System.Text.RegularExpressions.Regex]::Match(
+            $safeInject,
+            '(?im)^IDs:\s*(?<ids>.+)$'
+        )
+        if ($idsMatch.Success) {
+            $memoryIds = @(
+                $idsMatch.Groups['ids'].Value.Split(',') |
+                    ForEach-Object { $_.Trim() } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            )
+        }
+    }
+
+    return @{
+        HasBlock = $hasBlock
+        SessionKey = (Get-FirstNonEmptyValue -Values @($sessionKey) -Default "unknown")
+        MemoryIds = $memoryIds
+    }
+}
+
+function New-MemoryFeedbackDirective {
+    param(
+        [hashtable]$Metadata
+    )
+
+    if ($null -eq $Metadata -or $Metadata.HasBlock -ne $true) {
+        return ""
+    }
+
+    $memoryIdLines = @()
+    foreach ($memoryId in @($Metadata.MemoryIds)) {
+        $memoryIdLines += ("- {0}" -f $memoryId)
+    }
+
+    if ($memoryIdLines.Count -eq 0) {
+        $memoryIdLines += "- <none-parsed>"
+    }
+
+    return @(
+        "[signet:memory-feedback required=true]"
+        "If the injected payload for this turn contains a <memory-feedback> block, you MUST call `mcp_signet_memory_feedback` before answering."
+        "Use the session key and memory IDs listed in the normalized contract below."
+        "You must rate every listed memory ID. Use 0 for unused memories."
+        "Do not answer the user until the tool call has been sent."
+        ""
+        "<signet-memory-feedback-contract>"
+        "required_tool: mcp_signet_memory_feedback"
+        "call_before_answer: true"
+        ("session_key: {0}" -f $Metadata.SessionKey)
+        "default_unused_rating: 0"
+        "score_range: -1..1"
+        "memory_ids:"
+        $memoryIdLines
+        "</signet-memory-feedback-contract>"
+    ) -join [Environment]::NewLine
+}
+
+function Write-PromptSubmitAudit {
+    param(
+        [string]$SessionKey,
+        [string]$UserPrompt,
+        [hashtable]$RequestBody,
+        [string]$Inject,
+        [string]$Status,
+        [string]$ErrorMessage = ""
+    )
+
+    New-Item -ItemType Directory -Path $generatedDir -Force | Out-Null
+    $memoryFeedback = Get-MemoryFeedbackMetadata -Inject $Inject -DefaultSessionKey $SessionKey
+
+    $previewLine = (($Inject -replace "\r?\n", " ").Trim())
+    if ($previewLine.Length -gt 200) {
+        $previewLine = $previewLine.Substring(0, 200) + "..."
+    }
+
+    $entry = @{
+        timestampUtc = [DateTime]::UtcNow.ToString("o")
+        source = "UserPromptSubmit"
+        status = $Status
+        sessionKey = $SessionKey
+        daemonUrl = $daemonUrl
+        requestBody = $RequestBody
+        promptChars = $(if ($null -ne $UserPrompt) { $UserPrompt.Length } else { 0 })
+        promptHash = (Get-Sha256Hex -Text $UserPrompt)
+        injectChars = $(if ($null -ne $Inject) { $Inject.Length } else { 0 })
+        injectHash = (Get-Sha256Hex -Text $Inject)
+        containsMemoryFeedbackBlock = $memoryFeedback.HasBlock
+        memoryFeedbackSessionKey = $memoryFeedback.SessionKey
+        memoryFeedbackIds = @($memoryFeedback.MemoryIds)
+        injectPreview = (Get-FirstNonEmptyValue -Values @($previewLine) -Default "<empty>")
+        error = $ErrorMessage
+    }
+
+    $line = $entry | ConvertTo-Json -Compress -Depth 20
+
+    $auditLines = @()
+    if (Test-Path $promptSubmitAuditPath) {
+        $auditLines = @(Get-Content -Path $promptSubmitAuditPath)
+    }
+
+    $auditLines += $line
+    $auditLines = @($auditLines | Select-Object -Last 5)
+
+    [System.IO.File]::WriteAllText(
+        $promptSubmitAuditPath,
+        (($auditLines -join [Environment]::NewLine) + [Environment]::NewLine),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
+function Read-ExperimentConfig {
+    if (-not (Test-Path $experimentConfigPath)) {
+        return $null
+    }
+
+    try {
+        $parsed = Get-Content -Path $experimentConfigPath -Raw | ConvertFrom-Json -Depth 20
+        if ($null -eq $parsed) {
+            return $null
+        }
+
+        return $parsed
+    }
+    catch {
+        return $null
+    }
+}
+
+function Write-ExperimentLogEntry {
+    param(
+        [object]$Entry
+    )
+
+    New-Item -ItemType Directory -Path $generatedDir -Force | Out-Null
+    $line = $Entry | ConvertTo-Json -Compress -Depth 20
+    [System.IO.File]::AppendAllText($experimentLogPath, $line + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Get-ExperimentResponse {
+    param(
+        [object]$Experiment,
+        [string]$UserPrompt,
+        [object]$HookInput
+    )
+
+    if ($null -eq $Experiment) {
+        return $null
+    }
+
+    if ($Experiment.enabled -ne $true) {
+        return $null
+    }
+
+    $triggerPrompt = Get-FirstNonEmptyValue -Values @($Experiment.triggerPrompt)
+    $matchAnyPrompt = ($Experiment.matchAnyPrompt -eq $true)
+
+    if (-not $matchAnyPrompt -and [string]::IsNullOrWhiteSpace($triggerPrompt)) {
+        return $null
+    }
+
+    if ((-not $matchAnyPrompt) -and (-not [string]::Equals($UserPrompt.Trim(), $triggerPrompt.Trim(), [System.StringComparison]::Ordinal))) {
+        return $null
+    }
+
+    $experimentSentinel = $Experiment.sentinel
+    $sentinel = Get-FirstNonEmptyValue -Values @($experimentSentinel) -Default "SIGNET_SENTINEL_MISSING"
+    $field = Get-FirstNonEmptyValue -Values @($Experiment.field) -Default "systemMessage"
+    $instruction = Get-FirstNonEmptyValue -Values @(
+        $Experiment.instruction,
+        ("If you can see this injected hook payload, reply exactly: {0}" -f $sentinel)
+    )
+
+    $response = @{ continue = $true }
+
+    switch ($field) {
+        "systemMessage" {
+            $response.systemMessage = $instruction
+            break
+        }
+        "additionalContext" {
+            $response.additionalContext = $instruction
+            break
+        }
+        "hookSpecificAdditionalContext" {
+            $response.hookSpecificOutput = @{
+                hookEventName = "UserPromptSubmit"
+                additionalContext = $instruction
+            }
+            break
+        }
+        "context" {
+            $response.context = $instruction
+            break
+        }
+        "instructions" {
+            $response.instructions = $instruction
+            break
+        }
+        default {
+            $response.systemMessage = $instruction
+            $field = "systemMessage"
+            break
+        }
+    }
+
+    Write-ExperimentLogEntry -Entry @{
+        timestamp = [DateTime]::UtcNow.ToString("o")
+        mode = "response"
+        experimentId = $Experiment.id
+        field = $field
+        sentinel = $sentinel
+        matchAnyPrompt = $matchAnyPrompt
+        triggerPrompt = $triggerPrompt
+        sessionKey = Get-HookSessionKey -HookInput $HookInput
+        prompt = $UserPrompt
+        response = $response
+    }
+
+    return $response
 }
 
 function Get-FirstNonEmptyValue {
@@ -102,16 +396,29 @@ function Get-FirstNonEmptyValue {
     return $Default
 }
 
+function Get-HookSessionKey {
+    param(
+        [object]$HookInput
+    )
+
+    return Get-FirstNonEmptyValue -Values @(
+        $HookInput.sessionKey,
+        $HookInput.sessionId,
+        $HookInput.session_key,
+        $HookInput.session_id
+    )
+}
+
 function Get-SessionStatePath {
     param(
         [object]$HookInput,
         [string]$AgentIdentity
     )
 
+    $sessionKey = Get-HookSessionKey -HookInput $HookInput
     $sessionIdentityParts = @(
         $AgentIdentity,
-        $HookInput.sessionKey,
-        $HookInput.sessionId
+        $sessionKey
     ) | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) }
 
     $sessionIdentity = $sessionIdentityParts -join "|"
@@ -124,7 +431,7 @@ function Get-SessionStatePath {
     return Join-Path $promptRefreshStateDir ("{0}.json" -f $identityHash)
 }
 
-function Consume-InitialPromptRefreshSkip {
+function Remove-InitialPromptRefreshSkip {
     param(
         [string]$Path
     )
@@ -139,11 +446,11 @@ function Consume-InitialPromptRefreshSkip {
 
 try {
     $hookInput = Get-HookInputObject
-    $sessionMetadata = Get-NormalizedSessionMetadata -HookInput $hookInput
     Write-DebugInputFile -HookInput $hookInput
-    $sessionStatePath = Get-SessionStatePath -HookInput (@{ sessionKey = $sessionMetadata.sessionKey; sessionId = $sessionMetadata.sessionId }) -AgentIdentity $AgentId
+    $sessionStatePath = Get-SessionStatePath -HookInput $hookInput -AgentIdentity $AgentId
+    $sessionKey = Get-HookSessionKey -HookInput $hookInput
 
-    if (Consume-InitialPromptRefreshSkip -Path $sessionStatePath) {
+    if (Remove-InitialPromptRefreshSkip -Path $sessionStatePath) {
         @{
             continue = $true
         } | ConvertTo-Json -Depth 3
@@ -167,23 +474,69 @@ try {
         $userPrompt = $userPrompt.ToString()
     }
 
+    $experimentConfig = Read-ExperimentConfig
+    $experimentResponse = Get-ExperimentResponse -Experiment $experimentConfig -UserPrompt $userPrompt -HookInput $hookInput
+    if ($null -ne $experimentResponse) {
+        $experimentResponse | ConvertTo-Json -Depth 10
+        return
+    }
+
     $body = @{
         harness = $harnessName
         agentId = $AgentId
+        project = $projectPath
         cwd = $projectPath
+        userMessage = $userPrompt
         userPrompt = $userPrompt
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($sessionMetadata.sessionKey)) {
-        $body.sessionKey = $sessionMetadata.sessionKey
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($sessionMetadata.sessionId)) {
-        $body.sessionId = $sessionMetadata.sessionId
+    if (-not [string]::IsNullOrWhiteSpace($sessionKey)) {
+        $body.sessionKey = $sessionKey
+        $body.sessionId = $sessionKey
     }
 
     if ($null -ne $hookInput.lastAssistantMessage) {
         $body.lastAssistantMessage = $hookInput.lastAssistantMessage
+    }
+
+    $transcriptPath = Get-FirstNonEmptyValue -Values @(
+        $hookInput.transcript_path,
+        $hookInput.transcriptPath
+    )
+
+    $effectiveTranscriptPath = $transcriptPath
+    if (-not [string]::IsNullOrWhiteSpace($transcriptPath) -and (Test-Path $transcriptPath)) {
+        try {
+            $rawTranscript = [System.IO.File]::ReadAllText($transcriptPath)
+            $normalizedTranscript = Convert-SignetTranscriptContent -RawTranscript $rawTranscript
+
+            # VS Code custom-agent transcripts are JSONL; Signet's generic parser does not currently
+            # recognize their user.message / assistant.message shape, so hand off a normalized file.
+            if (-not [string]::IsNullOrWhiteSpace($normalizedTranscript) -and ($normalizedTranscript -ne $rawTranscript)) {
+                $normalizedTranscriptDir = Join-Path $generatedDir "normalized-transcripts"
+                New-Item -ItemType Directory -Path $normalizedTranscriptDir -Force | Out-Null
+
+                $normalizedTranscriptName = "{0}.prompt-submit.txt" -f [System.IO.Path]::GetFileNameWithoutExtension($transcriptPath)
+                $effectiveTranscriptPath = Join-Path $normalizedTranscriptDir $normalizedTranscriptName
+
+                [System.IO.File]::WriteAllText(
+                    $effectiveTranscriptPath,
+                    $normalizedTranscript + [Environment]::NewLine,
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            }
+        }
+        catch {
+            $effectiveTranscriptPath = $transcriptPath
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($effectiveTranscriptPath)) {
+        $body.transcriptPath = $effectiveTranscriptPath
+    }
+
+    if ($null -ne $hookInput.transcript -and $hookInput.transcript -is [string] -and -not [string]::IsNullOrWhiteSpace($hookInput.transcript)) {
+        $body.transcript = $hookInput.transcript
     }
 
     $response = Invoke-RestMethod -Method Post -Uri "$daemonUrl/api/hooks/user-prompt-submit" -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 10) -TimeoutSec 5
@@ -193,11 +546,23 @@ try {
         $inject = "[signet] UserPromptSubmit hook returned no context."
     }
 
-    Write-LiveContextFile -Inject $inject -Source "UserPromptSubmit"
+    Write-PromptSubmitAudit -SessionKey $sessionKey -UserPrompt $userPrompt -RequestBody $body -Inject $inject -Status "success"
+
+    Write-LiveContextFile -Inject (New-SignetDebugSummary -Source "UserPromptSubmit" -SessionKey $sessionKey -Inject $inject -RoleDescription "Diagnostic mirror of the live auto-injection payload. Agents must not read this file.") -Source "UserPromptSubmit"
+
+    @{
+        continue = $true
+        hookSpecificOutput = @{
+            hookEventName = "UserPromptSubmit"
+            additionalContext = (New-SignetAutoInjectPayload -Source "UserPromptSubmit" -SessionKey $sessionKey -Inject $inject)
+        }
+    } | ConvertTo-Json -Depth 10
+    return
 }
 catch {
     $inject = "[signet] UserPromptSubmit hook failed for harness '$harnessName': $($_.Exception.Message)"
-    Write-LiveContextFile -Inject $inject -Source "UserPromptSubmit"
+    Write-PromptSubmitAudit -SessionKey $sessionKey -UserPrompt $userPrompt -RequestBody $body -Inject $inject -Status "failure" -ErrorMessage $($_.Exception.Message)
+    Write-LiveContextFile -Inject (New-SignetDebugSummary -Source "UserPromptSubmit" -SessionKey $sessionKey -Inject $inject -RoleDescription "Diagnostic mirror of UserPromptSubmit failure state. Agents must not read this file.") -Source "UserPromptSubmit"
 }
 
 @{

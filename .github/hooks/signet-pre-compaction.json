@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "type": "command",
+        "windows": "pwsh -NoProfile -File .github/hooks/signet-pre-compaction.ps1 -AgentId signet-vscode-workspace-hook",
+        "timeout": 30
+      }
+    ]
+  }
+}

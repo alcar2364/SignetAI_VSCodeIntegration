@@ -28,9 +28,9 @@ Two details matter:
 - Hooks fail soft. If Signet is unavailable, the conversation continues.
 - Hook-delivered injection is the live source of truth.
 - Generated files under `.agentic/generated/` are diagnostic mirrors, not active
-   context sources.
+  context sources.
 - Prompt refresh is intentionally skipped on the first prompt after
-   `SessionStart` so the initial injection is not duplicated immediately.
+  `SessionStart` so the initial injection is not duplicated immediately.
 - Pre-compaction now follows Signet's dedicated `pre-compaction` endpoint for
   continuity checkpoints rather than treating compaction as a synthetic
   session-end transcript upload.
@@ -72,7 +72,7 @@ Two details matter:
 **Failure behavior:**
 
 - On daemon failure or timeout, the hook still returns successfully and injects
-   a short failure message instead of blocking the session.
+  a short failure message instead of blocking the session.
 
 **Outcome:**
 
@@ -132,7 +132,7 @@ processed.
 
 - On failure, the hook still returns `{ "continue": true }`.
 - The debug live-context file is updated with a failure snapshot, and the audit
-   log records the error.
+  log records the error.
 
 **Outcome:**
 
@@ -199,7 +199,7 @@ processed.
   normalized plain conversation transcript under `.agentic/generated/normalized-transcripts/`
   and forwards that compatibility file path to Signet.
 - Clears any legacy local transcript-state file if Signet reports `queued =
-  true` or returns a non-negative `memoriesSaved` count.
+true` or returns a non-negative `memoriesSaved` count.
 - Always returns `{ "continue": true }`.
 
 **Operational implication:**
@@ -211,28 +211,28 @@ processed.
 
 ## Files and Roles
 
-| File | Current role |
-| --- | --- |
-| `.github/hooks/signet-session-start.json` | Registers the active `SessionStart` hook. |
-| `.github/hooks/signet-user-prompt-submit.json` | Registers the active `UserPromptSubmit` hook. |
-| `.github/hooks/signet-pre-compaction.json` | Registers the active `PreCompact` hook. |
-| `.github/hooks/signet-session-end.json` | Registers the active `Stop` hook. |
-| `.agentic/hooks/signet-session-start.ps1` | Fetches initial context, writes debug mirrors, and creates the one-shot prompt-refresh skip marker. |
-| `.agentic/hooks/signet-user-prompt-submit.ps1` | Refreshes live context per prompt after the initial skip, normalizes VS Code transcript JSONL when a transcript path is present, writes audits, and surfaces memory-feedback contracts. |
-| `.agentic/hooks/signet-pre-compaction.ps1` | Active compaction hook that calls Signet's `pre-compaction` endpoint. |
-| `.agentic/hooks/signet-session-end.ps1` | Active shutdown hook that normalizes VS Code transcript JSONL when needed, hands the resulting transcript path to the daemon, and clears legacy local transcript-state when shutdown succeeds. |
-| `.agentic/hooks/signet-transcript-state.ps1` | Shared helper module for hook session identity, transcript-path parsing, VS Code transcript normalization, and cleanup of older transcript-state files. |
+| File                                           | Current role                                                                                                                                                                                   |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.github/hooks/signet-session-start.json`      | Registers the active `SessionStart` hook.                                                                                                                                                      |
+| `.github/hooks/signet-user-prompt-submit.json` | Registers the active `UserPromptSubmit` hook.                                                                                                                                                  |
+| `.github/hooks/signet-pre-compaction.json`     | Registers the active `PreCompact` hook.                                                                                                                                                        |
+| `.github/hooks/signet-session-end.json`        | Registers the active `Stop` hook.                                                                                                                                                              |
+| `.agentic/hooks/signet-session-start.ps1`      | Fetches initial context, writes debug mirrors, and creates the one-shot prompt-refresh skip marker.                                                                                            |
+| `.agentic/hooks/signet-user-prompt-submit.ps1` | Refreshes live context per prompt after the initial skip, normalizes VS Code transcript JSONL when a transcript path is present, writes audits, and surfaces memory-feedback contracts.        |
+| `.agentic/hooks/signet-pre-compaction.ps1`     | Active compaction hook that calls Signet's `pre-compaction` endpoint.                                                                                                                          |
+| `.agentic/hooks/signet-session-end.ps1`        | Active shutdown hook that normalizes VS Code transcript JSONL when needed, hands the resulting transcript path to the daemon, and clears legacy local transcript-state when shutdown succeeds. |
+| `.agentic/hooks/signet-transcript-state.ps1`   | Shared helper module for hook session identity, transcript-path parsing, VS Code transcript normalization, and cleanup of older transcript-state files.                                        |
 
 ## Signet Endpoints in Use
 
 The current implementation now uses daemon HTTP endpoints consistently:
 
-| Path | Used by | Purpose |
-| --- | --- | --- |
-| `POST /api/hooks/session-start` | `signet-session-start.ps1` | Initial context injection. |
-| `POST /api/hooks/user-prompt-submit` | `signet-user-prompt-submit.ps1` | Per-prompt context refresh. |
-| `POST /api/hooks/pre-compaction` | `signet-pre-compaction.ps1` | Compaction-time continuity checkpointing. |
-| `POST /api/hooks/session-end` | `signet-session-end.ps1` | Final transcript retention and session-end extraction through the local daemon. |
+| Path                                 | Used by                         | Purpose                                                                         |
+| ------------------------------------ | ------------------------------- | ------------------------------------------------------------------------------- |
+| `POST /api/hooks/session-start`      | `signet-session-start.ps1`      | Initial context injection.                                                      |
+| `POST /api/hooks/user-prompt-submit` | `signet-user-prompt-submit.ps1` | Per-prompt context refresh.                                                     |
+| `POST /api/hooks/pre-compaction`     | `signet-pre-compaction.ps1`     | Compaction-time continuity checkpointing.                                       |
+| `POST /api/hooks/session-end`        | `signet-session-end.ps1`        | Final transcript retention and session-end extraction through the local daemon. |
 
 ## Generated Artifacts
 
@@ -254,11 +254,11 @@ authoritative live context channel.
 ## Error Handling
 
 - `SessionStart` and `UserPromptSubmit` emit a short Signet status message on
-   failure instead of breaking the hook.
+  failure instead of breaking the hook.
 - `PreCompact` always returns `continue = true` after attempting the daemon
   `pre-compaction` call.
 - `Stop` runs with `SilentlyContinue` semantics and never blocks shutdown on
-   Signet errors.
+  Signet errors.
 
 ## Practical Summary
 

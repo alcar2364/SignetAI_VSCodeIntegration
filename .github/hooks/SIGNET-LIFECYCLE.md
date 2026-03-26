@@ -2,7 +2,7 @@
 
 This document describes the Signet lifecycle that is currently implemented in
 the workspace hook registrations and PowerShell scripts under
-`.github/hooks/` and `.agentic/hooks/`.
+`.github/hooks/`.
 
 It is intentionally implementation-first. If this file disagrees with a design
 note, treat the scripts and hook registrations as the source of truth.
@@ -20,14 +20,14 @@ Two details matter:
 
 - `SessionStart` and `UserPromptSubmit` use the daemon-backed HTTP injection
   path.
-- `PreCompact` is currently wired to
-  `.agentic/hooks/signet-pre-compaction.ps1`.
+- `PreCompact` is wired through `.github/hooks/signet-pre-compaction.ps1` and
+  uses Signet's dedicated `pre-compaction` endpoint.
 
 ## Current Principles
 
 - Hooks fail soft. If Signet is unavailable, the conversation continues.
 - Hook-delivered injection is the live source of truth.
-- Generated files under `.agentic/generated/` are diagnostic mirrors, not active
+- Generated files under `.github/Generated/` are diagnostic mirrors, not active
   context sources.
 - Prompt refresh is intentionally skipped on the first prompt after
   `SessionStart` so the initial injection is not duplicated immediately.
@@ -63,10 +63,10 @@ Two details matter:
 ```
 
 - Writes two debug-only markdown mirrors:
-  - `.agentic/generated/signet-session-start-context.md`
-  - `.agentic/generated/signet-live-context.md`
+  - `.github/Generated/signet-session-start-context.md`
+  - `.github/Generated/signet-live-context.md`
 - Creates a prompt-refresh state file under
-  `.agentic/generated/prompt-refresh-state/` with
+  `.github/Generated/prompt-refresh-state/` with
   `skipNextPromptRefresh = true`.
 
 **Failure behavior:**
@@ -92,16 +92,16 @@ processed.
   `promptText`, `userPrompt`, `userMessage`, `prompt`, `message`, `text`,
   `input`, `chatSessionInput`, `request`, or `user_input`.
 - Writes the raw hook payload to
-  `.agentic/generated/signet-last-user-prompt-input.json` for debugging.
+  `.github/Generated/signet-last-user-prompt-input.json` for debugging.
 - Checks the prompt-refresh state file created by `SessionStart`:
   - If the skip marker exists, it deletes that marker and returns
     `{ "continue": true }` without contacting Signet.
   - This means the first prompt after session start does not trigger an extra
     refresh.
 - If live-context experiment config exists at
-  `.agentic/generated/live-context-injection-experiment.json`, the script can
+  `.github/Generated/live-context-injection-experiment.json`, the script can
   short-circuit into a controlled experiment response and log the result to
-  `.agentic/generated/live-context-injection-results.jsonl`.
+  `.github/Generated/live-context-injection-results.jsonl`.
 - Otherwise it calls
   `POST http://127.0.0.1:3850/api/hooks/user-prompt-submit` with:
   - `harness = "vscode-custom-agent"`
@@ -123,9 +123,9 @@ processed.
 - If the Signet payload contains a `<memory-feedback>` block, prepends a
   normalized `mcp_signet_memory_feedback` contract before the injected payload.
 - Writes a debug mirror of the injected payload to
-  `.agentic/generated/signet-live-context.md`.
+  `.github/Generated/signet-live-context.md`.
 - Appends a compact audit record to
-  `.agentic/generated/signet-user-prompt-submit-audit.jsonl` and keeps only the
+  `.github/Generated/signet-user-prompt-submit-audit.jsonl` and keeps only the
   last five entries.
 
 **Failure behavior:**
@@ -144,9 +144,6 @@ processed.
 **Trigger:** VS Code is about to compact the conversation.
 
 **Registration:** `.github/hooks/signet-pre-compaction.json`
-
-**Important:** The active hook currently targets
-`.agentic/hooks/signet-pre-compaction.ps1`.
 
 **What the active script does:**
 
@@ -183,7 +180,7 @@ processed.
 
 **What the script does:**
 
-- Loads helper functions from `.agentic/hooks/signet-transcript-state.ps1` for
+- Loads helper functions from `.github/hooks/signet-transcript-state.ps1` for
   session identity resolution, transcript-path handling, VS Code transcript
   normalization, and legacy state cleanup.
 - Resolves transcript input from `transcript_path` or `transcriptPath`.
@@ -196,7 +193,7 @@ processed.
   - `transcriptPath` when the VS Code hook payload provides one
   - fallback inline `transcript` from hook input when no path is available
 - When the hook payload includes a VS Code JSONL transcript path, writes a
-  normalized plain conversation transcript under `.agentic/generated/normalized-transcripts/`
+  normalized plain conversation transcript under `.github/Generated/normalized-transcripts/`
   and forwards that compatibility file path to Signet.
 - Clears any legacy local transcript-state file if Signet reports `queued =
 true` or returns a non-negative `memoriesSaved` count.
@@ -211,17 +208,15 @@ true` or returns a non-negative `memoriesSaved` count.
 
 ## Files and Roles
 
-| File                                           | Current role                                                                                                                                                                                   |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.github/hooks/signet-session-start.json`      | Registers the active `SessionStart` hook.                                                                                                                                                      |
-| `.github/hooks/signet-user-prompt-submit.json` | Registers the active `UserPromptSubmit` hook.                                                                                                                                                  |
-| `.github/hooks/signet-pre-compaction.json`     | Registers the active `PreCompact` hook.                                                                                                                                                        |
-| `.github/hooks/signet-session-end.json`        | Registers the active `Stop` hook.                                                                                                                                                              |
-| `.agentic/hooks/signet-session-start.ps1`      | Fetches initial context, writes debug mirrors, and creates the one-shot prompt-refresh skip marker.                                                                                            |
-| `.agentic/hooks/signet-user-prompt-submit.ps1` | Refreshes live context per prompt after the initial skip, normalizes VS Code transcript JSONL when a transcript path is present, writes audits, and surfaces memory-feedback contracts.        |
-| `.agentic/hooks/signet-pre-compaction.ps1`     | Active compaction hook that calls Signet's `pre-compaction` endpoint.                                                                                                                          |
-| `.agentic/hooks/signet-session-end.ps1`        | Active shutdown hook that normalizes VS Code transcript JSONL when needed, hands the resulting transcript path to the daemon, and clears legacy local transcript-state when shutdown succeeds. |
-| `.agentic/hooks/signet-transcript-state.ps1`   | Shared helper module for hook session identity, transcript-path parsing, VS Code transcript normalization, and cleanup of older transcript-state files.                                        |
+- `.github/hooks/signet-session-start.json`: registers the active `SessionStart` hook.
+- `.github/hooks/signet-user-prompt-submit.json`: registers the active `UserPromptSubmit` hook.
+- `.github/hooks/signet-pre-compaction.json`: registers the active `PreCompact` hook.
+- `.github/hooks/signet-session-end.json`: registers the active `Stop` hook.
+- `.github/hooks/signet-session-start.ps1`: fetches initial context, writes debug mirrors, and creates the one-shot prompt-refresh skip marker.
+- `.github/hooks/signet-user-prompt-submit.ps1`: refreshes live context per prompt after the initial skip, normalizes VS Code transcript JSONL when a transcript path is present, writes audits, and surfaces memory-feedback contracts.
+- `.github/hooks/signet-pre-compaction.ps1`: active compaction hook that calls Signet's `pre-compaction` endpoint.
+- `.github/hooks/signet-session-end.ps1`: active shutdown hook that normalizes VS Code transcript JSONL when needed, hands the resulting transcript path to the daemon, and clears legacy local transcript-state when shutdown succeeds.
+- `.github/hooks/signet-transcript-state.ps1`: shared helper module for hook session identity, transcript-path parsing, VS Code transcript normalization, and cleanup of older transcript-state files.
 
 ## Signet Endpoints in Use
 
@@ -236,7 +231,7 @@ The current implementation now uses daemon HTTP endpoints consistently:
 
 ## Generated Artifacts
 
-The scripts currently write these generated files under `.agentic/generated/`:
+The scripts currently write these generated files under `.github/Generated/`:
 
 - `signet-session-start-context.md`
 - `signet-live-context.md`

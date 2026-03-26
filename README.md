@@ -1,230 +1,222 @@
 # SignetAI_VSCode_Integration
 
-This repository documents a working Signet integration for VS Code custom agents using a shared harness and a small set of PowerShell hooks.
+This repository captures the current Signet integration pattern for VS Code custom agents using workspace-scoped PowerShell hooks.
 
-The core idea is simple: let VS Code own the agent session lifecycle, and let thin hook adapters translate those lifecycle events into Signet daemon calls. Signet stays responsible for retrieval, memory, and synthesis. The VS Code side only passes session metadata, prompt text, and transcript references at the right moments.
+The scripts under `.github/hooks/` are the canonical implementation. If this README and the scripts ever disagree, trust the scripts.
 
-## What I built
+## Overview
 
-I wired a custom VS Code agent to a shared Signet harness named `vscode-custom-agent`.
+The integration uses a shared Signet harness named `vscode-custom-agent` and four VS Code hook events:
 
-The main runtime artifact is:
+- `SessionStart`
+- `UserPromptSubmit`
+- `PreCompact`
+- `Stop`
 
-- `.github/agents/signet-codex-vscode.agent.md`
+Each hook is a thin adapter. It reads VS Code hook input from stdin, normalizes the payload, calls the local Signet daemon, and returns a VS Code-compatible JSON response. Retrieval, ranking, recall, and memory synthesis stay inside Signet.
 
-That agent delegates Signet integration to workspace hooks under `.github/hooks/`:
+The hooks are registered through:
 
-- `signet-session-start.ps1`
-- `signet-user-prompt-submit.ps1`
-- `signet-pre-compaction.ps1`
-- `signet-session-end.ps1`
-- `signet-transcript-state.ps1`
+- `.github/hooks/signet-session-start.json`
+- `.github/hooks/signet-user-prompt-submit.json`
+- `.github/hooks/signet-pre-compaction.json`
+- `.github/hooks/signet-session-end.json`
 
-The hooks talk to a local Signet daemon at `http://127.0.0.1:3850`.
+The active PowerShell implementations are:
 
-## Why the harness exists
+- `.github/hooks/signet-session-start.ps1`
+- `.github/hooks/signet-user-prompt-submit.ps1`
+- `.github/hooks/signet-pre-compaction.ps1`
+- `.github/hooks/signet-session-end.ps1`
+- `.github/hooks/signet-transcript-state.ps1`
 
-VS Code custom agents give you lifecycle events, but they do not natively know how to hydrate a session with Signet memory or keep that memory fresh on every turn. The harness fills that gap.
+All daemon calls target `http://127.0.0.1:3850`.
 
-I used a shared harness name instead of a per-agent harness so multiple VS Code agents can participate in the same Signet memory model if needed. The hook layer stays intentionally thin:
+## Current Runtime Model
 
-- VS Code emits lifecycle events.
-- The PowerShell scripts normalize the event payloads.
-- The scripts call the Signet daemon.
-- Signet returns injected context or accepts session/transcript data.
-- The chat continues even if Signet is unavailable.
+The current model is hook-driven injection, not file-driven context loading.
 
-That last point matters. Hook failures should degrade to diagnostics, not break the user turn.
+- `SessionStart` injects initial Signet context directly through `hookSpecificOutput.additionalContext`.
+- `UserPromptSubmit` injects refreshed Signet context the same way after the initial skip.
+- Files under `.github/Generated/` are debug mirrors and local state, not the authoritative live context channel.
+- Hook failures are soft. The chat should continue even when Signet is unavailable.
 
-## Runtime flow
+That means the generated markdown files are there so you can inspect what the hooks last sent or attempted to send. They are not the canonical source of session memory.
 
-### 1. Session start
+## Hook Flow
 
-When the agent session begins, `signet-session-start.ps1` does four things:
+### 1. SessionStart
 
-1. Reads the incoming hook payload from stdin.
-2. Calls `POST /api/hooks/session-start` with the harness name, agent ID, project path, and any session identifiers VS Code provided.
-3. Writes the returned Signet context to `.github/Generated/signet-session-start-context.md` for debug purposes and to see the context being auto-injected.
-4. Returns `hookSpecificOutput.additionalContext` so VS Code can inject startup context directly into the first turn.
+`signet-session-start.ps1`:
 
-At the same time, it resets `.github/Generated/signet-live-context.md` to a placeholder message and creates a per-session prompt-refresh marker under `.github/Generated/prompt-refresh-state/`.
+- Accepts `sessionKey`, `sessionId`, `session_key`, or `session_id`.
+- Calls `POST /api/hooks/session-start` with `harness`, `agentId`, `project`, and optional session metadata.
+- Wraps the returned payload in an auto-injection header:
 
-That marker is what prevents the first prompt from immediately overwriting the startup context.
+```text
+[signet:auto-inject source=SessionStart session_key=<key> generated_at_utc=<timestamp>]
+```
 
-### 2. User prompt submit
+- Writes debug summaries to:
+  - `.github/Generated/signet-session-start-context.md`
+  - `.github/Generated/signet-live-context.md`
+- Creates a one-shot prompt-refresh state file under `.github/Generated/prompt-refresh-state/`.
 
-On each prompt, `signet-user-prompt-submit.ps1` reads the richest available prompt field from the hook payload, then calls `POST /api/hooks/user-prompt-submit`.
+That prompt-refresh state is important: it causes the next prompt-submit refresh to be skipped once so the initial session-start injection is not duplicated immediately.
 
-This hook is deliberately conservative:
+If the daemon call fails or returns no injection, the hook still succeeds and injects a short diagnostic string instead.
 
-- The first prompt refresh for a session is skipped.
-- Starting with the second prompt, the freshest Signet context is written to `.github/Generated/signet-live-context.md`.
-- The hook returns `{"continue": true}` instead of relying on prompt-submit context injection.
+### 2. UserPromptSubmit
 
-That fallback exists because session-start injection is reliable, while prompt-submit injection is not always guaranteed to become model-visible in the same way. Writing the refreshed memory to a generated file gives the agent a stable, debuggable surface to read from on later turns.
+`signet-user-prompt-submit.ps1`:
 
-The agent-side rule is explicit: after the first prompt, the agent should always read `.github/Generated/signet-live-context.md` before answering and treat what it read as active session memory until the file is refreshed again.
+- Writes the raw normalized hook payload to `.github/Generated/signet-last-user-prompt-input.json`.
+- Checks the per-session prompt-refresh state file.
+- If the skip marker exists, removes it and returns `{ "continue": true }` without calling Signet.
+- Otherwise reads the richest available user prompt field from the hook payload.
+- Normalizes transcript input when `transcriptPath` or `transcript_path` is present.
+- Calls `POST /api/hooks/user-prompt-submit` with prompt text, session metadata, project metadata, and transcript context when available.
+- Returns the Signet payload through `hookSpecificOutput.additionalContext`.
 
-For debugging, the raw normalized hook input is also written to `.github/Generated/signet-last-user-prompt-input.json`.
+This hook also has three implementation details worth knowing:
 
-### 3. Pre-compaction
+1. VS Code transcript normalization
 
-Before VS Code compacts a long conversation, `signet-pre-compaction.ps1` fires.
+VS Code custom-agent transcript files are JSONL. The helper module converts `user.message` and `assistant.message` records into a plain text conversation format before passing a compatibility transcript to Signet when needed.
 
-In the current implementation this hook is lightweight. It does not upload transcript content. Instead it:
+1. Memory-feedback contract surfacing
 
-1. Reads the session key and transcript path from the hook payload.
-2. Calls `POST /api/hooks/pre-compaction` with session metadata and the transcript path.
-3. Records local state in `.github/Generated/transcript-state/` so the Stop hook has per-session compaction history.
+If the injected Signet payload contains a `<memory-feedback>` block, the hook prepends a normalized contract telling the agent to call `mcp_signet_memory_feedback` before answering.
 
-This keeps compaction soft and low-risk. If Signet is down, compaction still proceeds.
+1. Audit logging
+
+The hook appends compact audit entries to `.github/Generated/signet-user-prompt-submit-audit.jsonl` and keeps the last five entries.
+
+The script can also run a controlled injection experiment when `.github/Generated/live-context-injection-experiment.json` exists and enables it. Experiment results are written to `.github/Generated/live-context-injection-results.jsonl`.
+
+On failure, the hook still returns `{ "continue": true }`, writes a diagnostic debug snapshot, and records the failure in the audit log.
+
+### 3. PreCompact
+
+`signet-pre-compaction.ps1` is now a lightweight continuity hook.
+
+It:
+
+- Resolves the current session key.
+- Reads optional `sessionContext` and `messageCount` values from the hook payload.
+- Calls `POST /api/hooks/pre-compaction`.
+- Returns `{ "continue": true }` regardless of Signet availability.
+
+What it does not do anymore:
+
+- It does not upload transcript deltas through the session-end path.
+- It does not maintain transcript offsets as the active compaction mechanism.
+- It does not block compaction when Signet is down.
 
 ### 4. Stop
 
-When the session ends, `signet-session-end.ps1` performs the final Signet reporting step.
+`signet-session-end.ps1` handles final session reporting.
 
-It sends the harness, agent identity, session metadata, and transcript path to `POST /api/hooks/session-end`. If the transcript file is available, it also reads it, converts the NDJSON-style VS Code transcript into a simpler `User:` / `Assistant:` conversation format, and includes that converted transcript in the request body.
+It:
 
-If Signet accepts the session-end request, the hook clears the local transcript state. If Signet fails, the hook swallows the failure so shutdown is never blocked.
+- Resolves session metadata and transcript input.
+- Uses `signet-transcript-state.ps1` helpers to normalize VS Code JSONL transcripts when a transcript path is available.
+- Writes normalized compatibility transcripts to `.github/Generated/normalized-transcripts/` when conversion is needed.
+- Calls `POST /api/hooks/session-end` with `harness`, `agentId`, session metadata, and either `transcriptPath` or fallback inline transcript content.
+- Clears any legacy transcript-state file after a successful Signet response.
 
-## Generated artifacts
+Like the other hooks, it always returns `{ "continue": true }` and never blocks shutdown on Signet failure.
 
-The integration relies on a few generated files under `.github/Generated/`:
+## Generated Files
 
-- `signet-session-start-context.md`: the context returned at session start.
-- `signet-live-context.md`: the rolling memory surface refreshed after the first prompt.
-- `signet-last-user-prompt-input.json`: a debug capture of the last prompt-submit payload.
-- `prompt-refresh-state/*.json`: per-session markers used to skip the first prompt refresh.
-- `transcript-state/*.json`: per-session state used by compaction and stop handling.
+The scripts currently create or update these artifacts under `.github/Generated/`:
 
-These files make the integration easier to debug because you can inspect exactly what Signet last returned without reverse-engineering the hook exchange from logs alone.
+- `signet-session-start-context.md`
+- `signet-live-context.md`
+- `signet-last-user-prompt-input.json`
+- `signet-user-prompt-submit-audit.jsonl`
+- `live-context-injection-results.jsonl` when experiments are enabled
+- `prompt-refresh-state/*.json`
+- `normalized-transcripts/*.txt` when transcript normalization is needed
+- `transcript-state/*.json` as legacy cleanup state
 
-## Smoke test
+These files are useful for debugging and inspection, but they are not the active session-memory contract.
 
-Use this smoke test to verify three separate behaviors:
+## Transcript Handling
 
-1. `SessionStart` auto-injects startup context into the first turn.
-2. `UserPromptSubmit` refreshes `.github/Generated/signet-live-context.md` starting on the second prompt.
-3. The agent reads `.github/Generated/signet-live-context.md` before answering after the first prompt.
+`signet-transcript-state.ps1` is shared helper code used by prompt-submit and session-end.
 
-### Preconditions
+Its important responsibilities are:
 
-- The Signet daemon is running on `http://127.0.0.1:3850`.
-- You start a brand new chat session with the custom agent.
-- You do not manually open either generated context file before the first prompt, or you will no longer be testing auto-injection behavior.
+- Computing stable per-session state file paths.
+- Resolving transcript paths from hook payloads.
+- Normalizing VS Code JSONL transcripts into plain `User:` and `Assistant:` conversation text.
+- Cleaning up legacy transcript-state files.
 
-### Step 1: Confirm session-start auto injection
+This matters because Signet's generic transcript handling does not natively understand the VS Code custom-agent JSONL record shape.
 
-Start a fresh chat with the custom agent and use a first prompt like:
+## Signet Endpoints In Use
 
-```text
-Without opening any files, tell me the current date and time from Signet session-start context and whether live context is active yet.
-```
+The current implementation calls these daemon endpoints:
 
-Expected result:
+- `POST /api/hooks/session-start`
+- `POST /api/hooks/user-prompt-submit`
+- `POST /api/hooks/pre-compaction`
+- `POST /api/hooks/session-end`
 
-- The agent answers with the Signet-provided date/time from the injected startup context.
-- The agent indicates that live context is not active yet on the first prompt.
-- `.github/Generated/signet-session-start-context.md` contains the startup context written by the hook.
-- `.github/Generated/signet-live-context.md` still contains the placeholder written by `SessionStart`, because the first prompt refresh is intentionally skipped.
+## Behavior Guarantees
 
-### Step 2: Confirm live-context refresh on the second prompt
+The scripts are written around a few explicit guarantees:
 
-Send a second prompt like:
+- Hooks fail soft.
+- Session-start injection is immediate.
+- Prompt-submit refresh is skipped once, then resumes on later prompts.
+- Generated files are diagnostic mirrors, not live context sources.
+- Memory-feedback instructions are surfaced when Signet emits them.
+- VS Code transcript JSONL is normalized before being handed to Signet when compatibility conversion is required.
 
-```text
-Before answering, use the live context for this turn and tell me the Signet recall query you see there.
-```
+## Practical Verification
 
-Expected result:
+If you want to verify the integration quickly:
 
-- `.github/Generated/signet-live-context.md` is rewritten by `UserPromptSubmit` before the answer is produced.
-- The file now contains a fresh `UserPromptSubmit` timestamp and a `[signet:recall ...]` block for the second prompt.
-- `.github/Generated/signet-last-user-prompt-input.json` shows the second prompt payload and the active session identifier.
+1. Start a fresh VS Code custom-agent session and confirm `SessionStart` injects Signet context.
+2. Send a first prompt and confirm no prompt-submit refresh occurs because the skip marker is consumed.
+3. Send a second prompt and confirm `UserPromptSubmit` calls Signet and updates the debug artifacts.
+4. End the session and confirm a normalized transcript file is written when the original transcript is JSONL.
 
-### Step 3: Confirm the agent actually read live context
+Useful artifacts to inspect during validation:
 
-The second prompt above is also the read check.
+- `.github/Generated/signet-session-start-context.md`
+- `.github/Generated/signet-live-context.md`
+- `.github/Generated/signet-last-user-prompt-input.json`
+- `.github/Generated/signet-user-prompt-submit-audit.jsonl`
+- `.github/Generated/normalized-transcripts/`
 
-Expected result:
-
-- The agent's answer references information that exists in `.github/Generated/signet-live-context.md` for that turn.
-- A strong signal is that it can quote or paraphrase the recall query or one of the returned memory summaries without you manually pasting that file into chat.
-- If the file updated but the answer ignores it, the hook refresh is working but the agent is not actually consuming live context.
-
-### Failure triage
-
-- If the first prompt lacks Signet startup details, `SessionStart` injection is failing.
-- If the second prompt does not rewrite `.github/Generated/signet-live-context.md`, the prompt-refresh skip marker or session-key normalization is broken.
-- If the live-context file updates but the answer does not reflect it, the runtime instructions are not being followed or the agent did not read the file before answering.
-
-## Design choices
-
-### Thin adapters, not smart hooks
-
-The PowerShell scripts do not try to implement memory logic themselves. They normalize VS Code hook input, call the daemon, and write small local state files when needed. Retrieval and memory decisions stay inside Signet.
-
-### Shared harness name
-
-The harness name is fixed as `vscode-custom-agent` so Signet can attribute activity consistently even if more than one custom VS Code agent uses the same integration pattern.
-
-### File-based live context fallback
-
-Instead of assuming every hook can inject model-visible context directly, only SessionStart does direct injection. Later prompt refreshes update a generated markdown file. That gives a deterministic fallback path and a visible debugging artifact.
-
-### Runtime tuning that made memory visible
-
-The Signet runtime also needed budget tuning outside this repository.
-
-The key change was that increasing the general memory budget alone was not enough. Live context generated by `UserPromptSubmit` is also constrained by hook-specific limits in the Signet runtime config.
-
-The working configuration was:
-
-- `memory.pipelineV2.guardrails.contextBudgetChars: 120000`
-- `hooks.userPromptSubmit.maxInjectChars: 120000`
-- `hooks.userPromptSubmit.recallLimit: 10`
-
-What each setting does:
-
-- `memory.pipelineV2.guardrails.contextBudgetChars` raises the overall memory-context ceiling available to Signet's pipeline.
-- `hooks.userPromptSubmit.maxInjectChars` raises the maximum number of characters the `UserPromptSubmit` hook is allowed to inject into live context.
-- `hooks.userPromptSubmit.recallLimit` caps recall output at 10 memories so the live-context surface stays bounded and predictable.
-
-Without the hook-specific `maxInjectChars` increase, the live-context file could still truncate even if the general pipeline budget was much larger.
-
-### Soft failure behavior
-
-Every hook is written so Signet outages do not kill the chat session. Startup falls back to a short diagnostic, prompt refresh keeps the turn moving, pre-compaction is best-effort, and Stop never blocks shutdown.
-
-## Repository layout
+## Repository Layout
 
 ```text
 .github/
-  copilot-instructions.md
   agents/
     signet-codex-vscode.agent.md
   hooks/
+    signet-session-start.json
     signet-session-start.ps1
+    signet-user-prompt-submit.json
     signet-user-prompt-submit.ps1
+    signet-pre-compaction.json
     signet-pre-compaction.ps1
+    signet-session-end.json
     signet-session-end.ps1
     signet-transcript-state.ps1
+    SIGNET-LIFECYCLE.md
   Generated/
     signet-session-start-context.md
     signet-live-context.md
     signet-last-user-prompt-input.json
-  skills/
-    vscode-signet-agent-harness/
+    signet-user-prompt-submit-audit.jsonl
+    normalized-transcripts/
 ```
-
-## Practical notes
-
-- This repo assumes a local Signet daemon is running on port `3850`.
-- The hook scripts are written for PowerShell on Windows.
-- The current behavior separates startup context from ongoing live-context refresh on purpose.
-- `.github/copilot-instructions.md` tells the agent to read startup context on turn one and to explicitly read rolling live context on every later turn.
-- The reference docs under `.github/skills/vscode-signet-agent-harness/` describe the intended harness pattern, but the PowerShell hooks are the source of truth for the exact runtime behavior in this repository.
 
 ## Summary
 
-The integration works by treating VS Code as the lifecycle host and Signet as the memory engine. A custom agent triggers small PowerShell adapters at `SessionStart`, `UserPromptSubmit`, `PreCompact`, and `Stop`. Those adapters call the Signet daemon, write local generated context when direct hook injection is not the safest option, and preserve the chat flow even when Signet is unavailable.
+This repository is a working VS Code-to-Signet harness built around thin PowerShell adapters and daemon-backed hook injection. The canonical behavior is in the scripts: direct auto-injection on session start and later prompt submits, a deliberate one-turn skip after session start, transcript normalization for VS Code JSONL, compact prompt-submit auditing, and best-effort continuity and shutdown reporting that never breaks the chat session.

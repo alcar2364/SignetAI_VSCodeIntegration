@@ -2,13 +2,10 @@ param(
     [string]$AgentId = "signet-vscode-custom-agent"
 )
 
-. (Join-Path $PSScriptRoot "signet-transcript-state.ps1")
-
 $ErrorActionPreference = "SilentlyContinue"
 
 $harnessName = "vscode-custom-agent"
 $daemonUrl = "http://127.0.0.1:3850"
-$generatedDir = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\generated"))
 $script:HookInputRaw = ($input | Out-String)
 
 function Get-HookInputObject {
@@ -35,59 +32,77 @@ function Get-HookInputObject {
     }
 }
 
+function Get-FirstNonEmptyValue {
+    param(
+        [object[]]$Values,
+        [string]$Default = ""
+    )
+
+    foreach ($value in $Values) {
+        if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
+    }
+
+    return $Default
+}
+
+function Get-HookSessionKey {
+    param(
+        [object]$HookInput
+    )
+
+    return Get-FirstNonEmptyValue -Values @(
+        $HookInput.sessionKey,
+        $HookInput.sessionId,
+        $HookInput.session_key,
+        $HookInput.session_id
+    )
+}
+
 try {
     $hookInput = Get-HookInputObject
-    $sessionKey = Get-SignetSessionKey -HookInput $hookInput
-    $sessionStatePath = Get-SignetTranscriptStatePath -GeneratedDir $generatedDir -HookInput $hookInput -AgentIdentity $AgentId
-    $transcriptState = Read-SignetTranscriptState -Path $sessionStatePath
-    $transcriptPath = Get-SignetHookTranscriptPath -HookInput $hookInput
+    $sessionKey = Get-HookSessionKey -HookInput $hookInput
+    $body = @{
+        harness = $harnessName
+    }
 
-    # PreCompact is lightweight: only send session metadata for compaction guidance
-    # Full transcript extraction happens at Stop, not here
-    if (-not [string]::IsNullOrWhiteSpace($sessionKey) -and -not [string]::IsNullOrWhiteSpace($transcriptPath)) {
-        $body = @{
-            harness = $harnessName
-            agentId = $AgentId
-            sessionKey = $sessionKey
-            sessionId = $sessionKey
-            transcript_path = $transcriptPath
-            trigger = "pre_compaction"
-        }
+    if (-not [string]::IsNullOrWhiteSpace($sessionKey)) {
+        $body.sessionKey = $sessionKey
+        $body.sessionId = $sessionKey
+    }
 
-        if ($null -ne $hookInput.cwd) {
-            $body.cwd = $hookInput.cwd
-        }
+    $sessionContext = Get-FirstNonEmptyValue -Values @(
+        $hookInput.sessionContext,
+        $hookInput.session_context,
+        $hookInput.summary,
+        $hookInput.compactionSummary
+    )
+    if (-not [string]::IsNullOrWhiteSpace($sessionContext)) {
+        $body.sessionContext = $sessionContext
+    }
 
-        # Send lightweight metadata to Signet for compaction guidance
-        # Failures are soft — compaction must still proceed
-        try {
-            Invoke-RestMethod -Method Post -Uri "$daemonUrl/api/hooks/pre-compaction" -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 10) -TimeoutSec 5 | Out-Null
-        }
-        catch {
-            # Signet unavailable or timeout — not fatal, continue
-        }
-
-        # Track pre-compaction event in state for Stop hook
-        $nextCount = 1
-        if ($null -ne $transcriptState -and $null -ne $transcriptState.preCompactionCount) {
+    $messageCount = $null
+    foreach ($candidate in @($hookInput.messageCount, $hookInput.message_count)) {
+        if ($candidate -ne $null) {
             try {
-                $nextCount = [int]$transcriptState.preCompactionCount + 1
+                $messageCount = [int]$candidate
+                break
             }
             catch {
-                $nextCount = 1
             }
         }
+    }
 
-        $nextState = @{
-            agentId = $AgentId
-            sessionKey = $sessionKey
-            sessionId = $hookInput.sessionId
-            transcriptPath = $transcriptPath
-            preCompactionCount = $nextCount
-            updatedAtUtc = [DateTime]::UtcNow.ToString("o")
-        }
+    if ($messageCount -ne $null) {
+        $body.messageCount = $messageCount
+    }
 
-        Write-SignetTranscriptState -Path $sessionStatePath -State $nextState
+    try {
+        Invoke-RestMethod -Method Post -Uri "$daemonUrl/api/hooks/pre-compaction" -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 10) -TimeoutSec 10 | Out-Null
+    }
+    catch {
+        # Signet unavailable or timeout — not fatal, continue
     }
 }
 catch {
